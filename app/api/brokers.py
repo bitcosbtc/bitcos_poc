@@ -25,32 +25,84 @@ async def add_broker(
     current_user: User = Depends(get_current_active_user)
 ):
     # Test connection immediately
-    try:
-        delta_api = DeltaExchangeAPI(broker.api_key, broker.secret_key, base_url=broker.redirect_url or "https://api.india.delta.exchange")
+    api_key_clean = broker.api_key.strip() if broker.api_key else ""
+    if api_key_clean.startswith("gAAAAA"):
+        try:
+            api_key_clean = encryption_service.decrypt(api_key_clean)
+        except Exception:
+            pass
+
+    secret_key_clean = broker.secret_key.strip() if broker.secret_key else ""
+    if secret_key_clean.startswith("gAAAAA"):
+        try:
+            secret_key_clean = encryption_service.decrypt(secret_key_clean)
+        except Exception:
+            pass
+
+    totp_secret_clean = broker.totp_secret.strip() if broker.totp_secret else None
+    if totp_secret_clean and totp_secret_clean.startswith("gAAAAA"):
+        try:
+            totp_secret_clean = encryption_service.decrypt(totp_secret_clean)
+        except Exception:
+            pass
+    
+    resolved_base_url = broker.redirect_url
+    
+    # Determine which base URLs to try
+    urls_to_try = []
+    if resolved_base_url:
+        urls_to_try.append(resolved_base_url)
+        # Fallback to the other endpoint if the user-specified one fails
+        alt_url = "https://api.delta.exchange" if "india" in resolved_base_url else "https://api.india.delta.exchange"
+        urls_to_try.append(alt_url)
+    else:
+        urls_to_try = ["https://api.india.delta.exchange", "https://api.delta.exchange"]
+        
+    connection_success = False
+    errors = []
+    
+    for url in urls_to_try:
+        print(f"Testing connection against Delta Exchange: {url}")
+        delta_api = DeltaExchangeAPI(api_key_clean, secret_key_clean, base_url=url)
         wallet = delta_api.get_wallet_balances()
         
-        if not wallet.get("success", True):
-            raise HTTPException(status_code=400, detail=wallet.get("error", "Failed to connect to Delta Exchange"))
+        if wallet.get("success", True):
+            resolved_base_url = url
+            connection_success = True
+            print(f"Successfully connected to Delta Exchange: {url}")
+            break
+        else:
+            err_code = wallet.get("error")
+            # If we get ip_not_whitelisted, the signature verification succeeded!
+            # It means the API secret is correct and this is the correct exchange URL.
+            if err_code == "ip_not_whitelisted_for_api_key":
+                resolved_base_url = url
+                client_ip = wallet.get("context", {}).get("client_ip", "your IP")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"IP restriction error. Please whitelist your server/local IP ({client_ip}) on the Delta Exchange ({url}) API Key settings page."
+                )
             
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            errors.append(f"{url} error: {err_code}")
+            
+    if not connection_success:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connection check failed. Details: {', '.join(errors)}"
+        )
 
-
-
-
-
-    encrypted_api_key = encryption_service.encrypt(broker.api_key)
-    encrypted_secret_key = encryption_service.encrypt(broker.secret_key)
+    encrypted_api_key = encryption_service.encrypt(api_key_clean)
+    encrypted_secret_key = encryption_service.encrypt(secret_key_clean)
     
     new_broker = Broker(
         user_id=current_user.id,
         broker_name=broker.broker_name,
-        broker_login_id=broker.broker_login_id,
+        broker_login_id=broker.broker_login_id.strip() if broker.broker_login_id else "",
         api_key_encrypted=encrypted_api_key,
         secret_key_encrypted=encrypted_secret_key,
-        totp_secret_encrypted=encryption_service.encrypt(broker.totp_secret) if broker.totp_secret else None,
+        totp_secret_encrypted=encryption_service.encrypt(totp_secret_clean) if totp_secret_clean else None,
         name_tag=broker.name_tag,
-        redirect_url=broker.redirect_url,
+        redirect_url=resolved_base_url,
         status="ACTIVE",
         token_generated_at=datetime.utcnow()
     )
@@ -133,13 +185,34 @@ async def update_broker(
         raise HTTPException(status_code=404, detail="Broker not found")
     
     if broker_update.broker_login_id:
-        broker.broker_login_id = broker_update.broker_login_id
+        broker.broker_login_id = broker_update.broker_login_id.strip()
+        
     if broker_update.api_key:
-        broker.api_key_encrypted = encryption_service.encrypt(broker_update.api_key)
+        api_key_clean = broker_update.api_key.strip()
+        if api_key_clean.startswith("gAAAAA"):
+            try:
+                api_key_clean = encryption_service.decrypt(api_key_clean)
+            except Exception:
+                pass
+        broker.api_key_encrypted = encryption_service.encrypt(api_key_clean)
+        
     if broker_update.secret_key:
-        broker.secret_key_encrypted = encryption_service.encrypt(broker_update.secret_key)
+        secret_key_clean = broker_update.secret_key.strip()
+        if secret_key_clean.startswith("gAAAAA"):
+            try:
+                secret_key_clean = encryption_service.decrypt(secret_key_clean)
+            except Exception:
+                pass
+        broker.secret_key_encrypted = encryption_service.encrypt(secret_key_clean)
+        
     if broker_update.totp_secret:
-        broker.totp_secret_encrypted = encryption_service.encrypt(broker_update.totp_secret)
+        totp_clean = broker_update.totp_secret.strip()
+        if totp_clean.startswith("gAAAAA"):
+            try:
+                totp_clean = encryption_service.decrypt(totp_clean)
+            except Exception:
+                pass
+        broker.totp_secret_encrypted = encryption_service.encrypt(totp_clean)
     if broker_update.name_tag:
         broker.name_tag = broker_update.name_tag
     if broker_update.status:
@@ -187,7 +260,7 @@ async def generate_token(
     secret_key = encryption_service.decrypt(broker.secret_key_encrypted)
     
     try:
-        delta_api = DeltaExchangeAPI(api_key, secret_key)
+        delta_api = DeltaExchangeAPI(api_key, secret_key, base_url=broker.redirect_url or "https://api.india.delta.exchange")
         wallet = delta_api.get_wallet_balances()
         
         if wallet.get("success", True):
@@ -227,4 +300,5 @@ async def get_broker_otp(
         "remaining_seconds": remaining,
         "broker_id": broker.id,
         "name_tag": broker.name_tag
-    }
+    }
+

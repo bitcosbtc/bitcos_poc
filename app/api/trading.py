@@ -28,7 +28,7 @@ def get_delta_api(broker_id: int, user_id: int, db: Session) -> DeltaExchangeAPI
     api_key = encryption_service.decrypt(broker.api_key_encrypted)
     secret_key = encryption_service.decrypt(broker.secret_key_encrypted)
     
-    return DeltaExchangeAPI(api_key, secret_key)
+    return DeltaExchangeAPI(api_key, secret_key, base_url=broker.redirect_url or "https://api.india.delta.exchange")
 
 @router.get("/positions/{broker_id}")
 async def get_positions(
@@ -714,3 +714,4 @@ async def update_mtm_settings(
     db.commit()
     db.refresh(settings)
     return settings
+

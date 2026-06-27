@@ -392,3 +392,4 @@ async def trading_websocket(
         task.cancel()
 
     print(f"DEBUG: WS handler done for broker {broker_id}")
+
