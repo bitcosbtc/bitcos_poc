@@ -337,8 +337,29 @@ async def trading_websocket(
 
                     # Strip prefixes (ticker:, v2:, etc.) for Delta compatibility
                     pub_syms = []
-                    for s in (symbols if symbols else [".BTCUSD"]):
-                        pub_syms.append(str(s).split(":", 1)[-1])
+                    
+                    # Auto-discover options symbols if symbols list is empty but underlying & expiry are provided
+                    if not symbols and expiry and underlying:
+                        try:
+                            delta_api = DeltaExchangeAPI(api_key, secret_key, base_url)
+                            products_res = await asyncio.to_thread(delta_api.get_products)
+                            if products_res.get("success"):
+                                prefix = f"{underlying}-{expiry}-"
+                                for p in products_res.get("result", []):
+                                    sym = p.get("symbol", "")
+                                    c_type = p.get("contract_type", "")
+                                    if sym.startswith(prefix) and c_type in ["call_options", "put_options"]:
+                                        pub_syms.append(sym)
+                                print(f"SUCCESS: Auto-subscribed {len(pub_syms)} options symbols for {prefix}")
+                        except Exception as e:
+                            print(f"ERROR: Failed to auto-fetch option symbols: {e}")
+
+                    if not pub_syms:
+                        for s in (symbols if symbols else [".BTCUSD"]):
+                            pub_syms.append(str(s).split(":", 1)[-1])
+
+                    if ".BTCUSD" not in pub_syms:
+                        pub_syms.append(".BTCUSD")
                     
                     if expiry and f"{underlying}-{expiry}" not in pub_syms:
                         pub_syms.append(f"{underlying}-{expiry}")

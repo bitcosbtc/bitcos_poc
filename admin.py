@@ -36,9 +36,9 @@ try:
     else:
         print("\n No admin found. Creating new admin user...")
         admin = User(
-            username="admin",
-            email="admin@gmail.com",
-            password_hash=get_password_hash("admin123"),
+            username="admin1",
+            email="test@gmail.com",
+            password_hash=get_password_hash("test123"),
             role="admin",
             is_active=True
         )
