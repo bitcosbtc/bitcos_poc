@@ -8,8 +8,8 @@ from typing import Optional, Dict
 
 class DeltaExchangeAPI:
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.india.delta.exchange"):
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key = api_key.strip() if api_key else ""
+        self.api_secret = api_secret.strip() if api_secret else ""
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
     
@@ -27,9 +27,9 @@ class DeltaExchangeAPI:
         url = f"{self.base_url}{endpoint}"
         
         if method == "GET" and payload:
-            payload_str = "?" + urllib.parse.urlencode(payload)
+            payload_str = "?" + urllib.parse.urlencode(payload, doseq=True)
         elif method in ["POST", "PUT", "DELETE"] and payload:
-            payload_str = json.dumps(payload, separators=(',', ':'))
+            payload_str = json.dumps(payload, separators=( ',', ':' ))
         else:
             payload_str = ""
             
@@ -44,7 +44,9 @@ class DeltaExchangeAPI:
         
         try:
             if method == "GET":
-                response = self.session.get(url, headers=headers, params=payload)
+                if payload:
+                    url = f"{url}{payload_str}"
+                response = self.session.get(url, headers=headers)
             elif method == "POST":
                 response = self.session.post(url, headers=headers, data=payload_str)
             elif method == "PUT":
@@ -59,6 +61,7 @@ class DeltaExchangeAPI:
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_data = e.response.json()
+                    print("RAW DELTA ERROR RESPONSE:", error_data)  # Debugging line to see expected signature context
                     if "error" in error_data and isinstance(error_data["error"], dict):
                         error_msg = error_data["error"].get("message") or error_data["error"].get("code") or str(error_data["error"])
                     else:

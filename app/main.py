@@ -15,7 +15,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://bitcos-frontend.vercel.app","http://43.204.233.104","http://localhost:9999"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
