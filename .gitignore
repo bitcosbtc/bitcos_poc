@@ -1,0 +1,11 @@
+# Ignore integration guide locally
+integration_guide.md
+
+# Ignore Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.log
+.env

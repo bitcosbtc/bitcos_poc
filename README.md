@@ -101,24 +101,5 @@ sudo systemctl restart nginx
 } -->
 
 
-Delta Exchange API Service Class:
 
-File Path: 
-app/services/delta_exchange.py
-What changed: Fixes signature generation logic for GET requests with query parameters (prepends ? to the signature payload) and changes the default API base URL to India (api.india.delta.exchange).
-Brokers API Endpoints:
-
-File Path: 
-app/api/brokers.py
-What changed: Cleans/strips whitespaces from API credentials, decodes Fernet-encrypted keys sent from the frontend request payload, implements dual-endpoint check (tests India then Global automatically), and handles IP restriction errors by outputting the specific IP to whitelist.
-Trading API Routes & Helper:
-
-File Path: 
-app/api/trading.py
-What changed: Aligns the default base URL default to the India Exchange in get_delta_api if no broker redirect URL is stored.
-Websocket API Routes:
-
-File Path: 
-app/api/websocket.py
-What changed: Aligns the default base URL default to the India Exchange in the websocket handler if no broker redirect URL is stored.
 

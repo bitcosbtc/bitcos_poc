@@ -45,6 +45,25 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+def normalize_expiry_to_ddmmyy(expiry: str) -> str:
+    if len(expiry) == 6 and expiry.isdigit():
+        first_two = int(expiry[0:2])
+        last_two = int(expiry[4:6])
+        middle_two = int(expiry[2:4])
+        
+        # If the last two digits represent the year (e.g., 26 for 2026), it's already DDMMYY
+        if 20 <= last_two <= 40 and 1 <= middle_two <= 12:
+            return expiry
+            
+        # If the first two digits represent the year (e.g., 26 for 2026), it is YYMMDD, convert to DDMMYY
+        if 20 <= first_two <= 40 and 1 <= middle_two <= 12:
+            yy = expiry[0:2]
+            mm = expiry[2:4]
+            dd = expiry[4:6]
+            return f"{dd}{mm}{yy}"
+            
+    return expiry
+
 # ── Server-side trade signal store ────────────────────────────────────
 # Keyed by broker_id → list of pending trade signals
 # iframe POSTs signals here, app.py polls to get them and update basket
@@ -192,7 +211,7 @@ async def trading_websocket(
                 if symbol and price:
                     global_cache.update_price(symbol, float(price))
             
-            elif t in ["user_balances", "v2/user_balances"] and b_id:
+            elif t in ["user_balances", "v2/user_balances", "wallets", "v2/wallets"] and b_id:
                 bals = {}
                 for b in payload:
                     if not isinstance(b, dict): continue
@@ -292,9 +311,9 @@ async def trading_websocket(
                     await priv_ws.send(json.dumps({
                         "type": "subscribe",
                         "payload": {"channels": [
-                            {"name": "user_balances"},
-                            {"name": "positions"},
-                            {"name": "orders"},
+                            {"name": "user_balances", "symbols": ["all"]},
+                            {"name": "positions", "symbols": ["all"]},
+                            {"name": "orders", "symbols": ["all"]},
                         ]}
                     }))
                     print("SUCCESS: Private WS subscribed: user_balances, positions, orders")
@@ -341,16 +360,17 @@ async def trading_websocket(
                     # Auto-discover options symbols if symbols list is empty but underlying & expiry are provided
                     if not symbols and expiry and underlying:
                         try:
+                            normalized_expiry = normalize_expiry_to_ddmmyy(expiry)
                             delta_api = DeltaExchangeAPI(api_key, secret_key, base_url)
                             products_res = await asyncio.to_thread(delta_api.get_products)
                             if products_res.get("success"):
-                                prefix = f"{underlying}-{expiry}-"
                                 for p in products_res.get("result", []):
                                     sym = p.get("symbol", "")
                                     c_type = p.get("contract_type", "")
-                                    if sym.startswith(prefix) and c_type in ["call_options", "put_options"]:
-                                        pub_syms.append(sym)
-                                print(f"SUCCESS: Auto-subscribed {len(pub_syms)} options symbols for {prefix}")
+                                    if c_type in ["call_options", "put_options"]:
+                                        if sym.endswith(f"-{normalized_expiry}") and f"-{underlying}-" in sym:
+                                            pub_syms.append(sym)
+                                print(f"SUCCESS: Auto-subscribed {len(pub_syms)} options symbols for {underlying} on {normalized_expiry}")
                         except Exception as e:
                             print(f"ERROR: Failed to auto-fetch option symbols: {e}")
 
@@ -360,9 +380,6 @@ async def trading_websocket(
 
                     if ".BTCUSD" not in pub_syms:
                         pub_syms.append(".BTCUSD")
-                    
-                    if expiry and f"{underlying}-{expiry}" not in pub_syms:
-                        pub_syms.append(f"{underlying}-{expiry}")
 
                     task_key = expiry or "default"
                     # Cancel previous task for same key
