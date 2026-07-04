@@ -67,8 +67,8 @@ async def get_positions(
                         notional=pos.get("notional", 0),
                         margin=pos.get("margin", 0),
                         unrealized_pnl=pos.get("unrealized_pnl", 0)
-                )
-                db.add(new_pos)
+                    )
+                    db.add(new_pos)
         
             db.commit()
             return positions_data
