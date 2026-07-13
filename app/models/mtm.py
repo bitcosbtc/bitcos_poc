@@ -13,4 +13,4 @@ class MTMSettings(Base):
     is_active = Column(Boolean, default=False)
     peak_upnl_pct = Column(Float, default=0.0)
     
-    user = relationship("User")
+    user = relationship("User", back_populates="mtm_settings")

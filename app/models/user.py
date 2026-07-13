@@ -15,3 +15,4 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     brokers = relationship("Broker", back_populates="user", cascade="all, delete-orphan")
+    mtm_settings = relationship("MTMSettings", back_populates="user", cascade="all, delete-orphan", uselist=False)
