@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/ws", tags=["Websocket"])
 # ── WebSocket Connection Manager ──────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[int, list[WebSocket]] = {} # user_id -> [WS]
+        self.active_connections: dict[int, list[WebSocket]] = {} # user_id -> [WS]
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
@@ -66,7 +66,6 @@ def normalize_expiry_to_ddmmyy(expiry: str) -> str:
 
 # ── Server-side trade signal store ────────────────────────────────────
 # Keyed by broker_id → list of pending trade signals
-# iframe POSTs signals here, app.py polls to get them and update basket
 _trade_signals: dict[int, list] = {}
 
 
@@ -89,7 +88,6 @@ async def get_trade_signals(broker_id: int):
     """Polled by app.py to retrieve and clear pending trade signals."""
     signals = _trade_signals.pop(broker_id, [])
     return {"signals": signals}
-
 
 
 async def get_current_user_ws(token: str, db: Session) -> User:
@@ -126,6 +124,246 @@ def get_open_symbols(api_key: str, secret_key: str, base_url: str) -> list:
         return []
 
 
+# ── Global Cache Update Helper ───────────────────────────────────────────
+def update_global_cache(raw: str, b_id: int = None):
+    try:
+        msg = json.loads(raw)
+        t = msg.get("type", "")
+        payload = msg.get("payload", [])
+        if not isinstance(payload, list):
+            payload = [payload]
+
+        if t in ["mark_price", "v2/mark_price", "ticker", "v2/ticker"]:
+            symbol = msg.get("symbol") or (payload[0].get("symbol") if payload and isinstance(payload[0], dict) else None)
+            price = msg.get("price") or (payload[0].get("mark_price") if payload and isinstance(payload[0], dict) else None) or (payload[0].get("price") if payload and isinstance(payload[0], dict) else None)
+            if symbol and price:
+                global_cache.update_price(symbol, float(price))
+        
+        elif t in ["user_balances", "v2/user_balances", "wallets", "v2/wallets"] and b_id:
+            bals = {}
+            for b in payload:
+                if not isinstance(b, dict): continue
+                sym = b.get("asset_symbol") or b.get("symbol")
+                if sym:
+                    bals[sym] = b
+            global_cache.update_balances(b_id, bals)
+
+        elif t in ["positions", "v2/positions"] and b_id:
+            for p in payload:
+                if not isinstance(p, dict): continue
+                pid = p.get("product_id")
+                if pid:
+                    uk = f"{pid}_{b_id}"
+                    global_cache.update_position(uk, p)
+    except Exception as e:
+        print(f"DEBUG: Cache update error: {e}")
+
+
+# ── Shared Delta Connection Pool ─────────────────────────────────────────
+class DeltaConnectionPool:
+    def __init__(self):
+        # broker_id -> list of active browser WebSockets
+        self.clients: dict[int, list[WebSocket]] = {}
+        # broker_id -> asyncio Task running the private WS stream
+        self.private_tasks: dict[int, asyncio.Task] = {}
+        # broker_id -> asyncio Task running the public WS stream
+        self.public_tasks: dict[int, asyncio.Task] = {}
+        # broker_id -> set of active symbols subscribed on public WS
+        self.public_symbols: dict[int, set[str]] = {}
+        # broker_id -> asyncio Queue to send subscription updates to the public WS task
+        self.public_subscription_queues: dict[int, asyncio.Queue] = {}
+
+    async def broadcast_raw(self, broker_id: int, message: str):
+        if broker_id in self.clients:
+            for ws in list(self.clients[broker_id]):
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    self.remove_client(broker_id, ws)
+
+    async def broadcast(self, broker_id: int, message: dict):
+        if broker_id in self.clients:
+            for ws in list(self.clients[broker_id]):
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    self.remove_client(broker_id, ws)
+
+    async def add_client(self, broker_id: int, ws: WebSocket, api_key: str, secret_key: str, private_url: str, public_url: str, initial_symbols: list[str]):
+        if broker_id not in self.clients:
+            self.clients[broker_id] = []
+        self.clients[broker_id].append(ws)
+        print(f"DEBUG: Added client to broker {broker_id}. Total: {len(self.clients[broker_id])}")
+
+        # Initialize public symbols with default index and initial_symbols
+        if broker_id not in self.public_symbols:
+            self.public_symbols[broker_id] = set([".BTCUSD"])
+        for s in initial_symbols:
+            self.public_symbols[broker_id].add(s)
+
+        # Start private task if not running or done
+        if broker_id not in self.private_tasks or self.private_tasks[broker_id].done():
+            self.private_tasks[broker_id] = asyncio.create_task(
+                self.stream_private_shared(broker_id, api_key, secret_key, private_url)
+            )
+
+        # Start public task if not running or done
+        if broker_id not in self.public_tasks or self.public_tasks[broker_id].done():
+            self.public_subscription_queues[broker_id] = asyncio.Queue()
+            self.public_tasks[broker_id] = asyncio.create_task(
+                self.stream_public_shared(broker_id, public_url)
+            )
+
+    def remove_client(self, broker_id: int, ws: WebSocket):
+        if broker_id in self.clients:
+            if ws in self.clients[broker_id]:
+                self.clients[broker_id].remove(ws)
+                print(f"DEBUG: Removed client from broker {broker_id}. Remaining: {len(self.clients[broker_id])}")
+            if not self.clients[broker_id]:
+                print(f"DEBUG: No clients left for broker {broker_id}. Stopping shared WS connections.")
+                if broker_id in self.private_tasks:
+                    self.private_tasks[broker_id].cancel()
+                    del self.private_tasks[broker_id]
+                if broker_id in self.public_tasks:
+                    self.public_tasks[broker_id].cancel()
+                    del self.public_tasks[broker_id]
+                if broker_id in self.public_symbols:
+                    del self.public_symbols[broker_id]
+                if broker_id in self.public_subscription_queues:
+                    del self.public_subscription_queues[broker_id]
+
+    def update_symbols(self, broker_id: int, new_symbols: list[str]):
+        if broker_id in self.public_symbols:
+            current_syms = self.public_symbols[broker_id]
+            added = False
+            for s in new_symbols:
+                if s not in current_syms:
+                    current_syms.add(s)
+                    added = True
+            
+            if added:
+                queue = self.public_subscription_queues.get(broker_id)
+                if queue:
+                    queue.put_nowait(current_syms)
+
+    async def stream_private_shared(self, broker_id: int, api_key: str, secret_key: str, url: str):
+        retry = 3
+        while broker_id in self.clients and len(self.clients[broker_id]) > 0:
+            print(f"DEBUG: Shared Private WS connecting for broker {broker_id}...")
+            try:
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=10, open_timeout=15
+                ) as priv_ws:
+                    # Auth
+                    ts  = str(int(time.time()))
+                    sig = hmac.new(secret_key.encode(), ("GET" + ts + "/live").encode(), hashlib.sha256).hexdigest()
+                    await priv_ws.send(json.dumps({
+                        "type": "auth",
+                        "payload": {"api-key": api_key, "signature": sig, "timestamp": ts}
+                    }))
+                    
+                    auth_raw = await asyncio.wait_for(priv_ws.recv(), timeout=6.0)
+                    auth_msg = json.loads(auth_raw)
+                    print(f"DEBUG: Shared Private WS auth response for broker {broker_id}: {auth_raw[:200]}")
+                    if auth_msg.get("type") == "error":
+                        err_msg = auth_msg.get("message", "Unknown error")
+                        print(f"ERROR: Shared Private WS auth failed for broker {broker_id}: {err_msg}")
+                        await self.broadcast(broker_id, {
+                            "type": "delta_error",
+                            "message": f"Delta auth failed: {err_msg}"
+                        })
+                        await asyncio.sleep(30)
+                        continue
+
+                    # Subscribe private channels
+                    await priv_ws.send(json.dumps({
+                        "type": "subscribe",
+                        "payload": {"channels": [
+                            {"name": "wallets", "symbols": ["all"]},
+                            {"name": "positions", "symbols": ["all"]},
+                            {"name": "orders", "symbols": ["all"]},
+                        ]}
+                    }))
+                    print(f"SUCCESS: Shared Private WS subscribed: wallets, positions, orders for broker {broker_id}")
+
+                    async for raw in priv_ws:
+                        if broker_id not in self.clients or not self.clients[broker_id]:
+                            break
+                        try:
+                            update_global_cache(raw, broker_id)
+                            await self.broadcast_raw(broker_id, raw)
+                        except Exception as e:
+                            print(f"ERROR: Failed processing private WS message: {e}")
+                retry = 3
+            except asyncio.CancelledError:
+                print(f"DEBUG: Shared Private WS task cancelled for broker {broker_id}")
+                break
+            except Exception as e:
+                print(f"DEBUG: Shared Private WS error for broker {broker_id} ({e}), retry in {retry}s")
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, 30)
+
+    async def stream_public_shared(self, broker_id: int, url: str):
+        retry = 2
+        while broker_id in self.clients and len(self.clients[broker_id]) > 0:
+            print(f"DEBUG: Shared Public WS connecting for broker {broker_id}...")
+            try:
+                queue = self.public_subscription_queues.get(broker_id)
+                if not queue:
+                    break
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=10, open_timeout=15
+                ) as pub_ws:
+                    print(f"SUCCESS: Shared Public WS connected for broker {broker_id}")
+                    
+                    async def subscription_handler():
+                        while broker_id in self.clients and len(self.clients[broker_id]) > 0:
+                            try:
+                                symbols = await queue.get()
+                                if symbols:
+                                    print(f"DEBUG: Shared Public WS subscribing to: {symbols}")
+                                    await pub_ws.send(json.dumps({
+                                        "type": "subscribe",
+                                        "payload": {"channels": [{"name": "ticker", "symbols": list(symbols)}]}
+                                    }))
+                                queue.task_done()
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as ex:
+                                print(f"ERROR: subscription_handler error: {ex}")
+                                
+                    sub_task = asyncio.create_task(subscription_handler())
+                    
+                    try:
+                        current_syms = self.public_symbols.get(broker_id, set())
+                        if current_syms:
+                            await pub_ws.send(json.dumps({
+                                "type": "subscribe",
+                                "payload": {"channels": [{"name": "ticker", "symbols": list(current_syms)}]}
+                            }))
+                        
+                        async for raw in pub_ws:
+                            if broker_id not in self.clients or not self.clients[broker_id]:
+                                break
+                            try:
+                                update_global_cache(raw, broker_id)
+                                await self.broadcast_raw(broker_id, raw)
+                            except Exception:
+                                pass
+                    finally:
+                        sub_task.cancel()
+                retry = 2
+            except asyncio.CancelledError:
+                print(f"DEBUG: Shared Public WS task cancelled for broker {broker_id}")
+                break
+            except Exception as e:
+                print(f"DEBUG: Shared Public WS error for broker {broker_id} ({e}), retry in {retry}s")
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, 30)
+
+delta_pool = DeltaConnectionPool()
+
+
 @router.websocket("/trading/{broker_id}")
 async def trading_websocket(
     websocket: WebSocket,
@@ -133,13 +371,10 @@ async def trading_websocket(
     token: str = Query(...)
 ):
     print(f"DEBUG: WebSocket request received for broker {broker_id}")
-    # We will accept after auth check if possible, or accept now
-    # await websocket.accept()
 
     from ..database import SessionLocal
     db = SessionLocal()
     try:
-        # ── Authenticate user ──────────────────────────────────────────────
         user = await get_current_user_ws(token, db)
         if not user:
             await websocket.accept()
@@ -150,7 +385,6 @@ async def trading_websocket(
         await manager.connect(user.id, websocket)
         print(f"SUCCESS: WebSocket connection established and managed for user {user.id}, broker {broker_id}")
 
-        # ── Get broker credentials ─────────────────────────────────────────
         broker = db.query(Broker).filter(
             Broker.id == broker_id, Broker.user_id == user.id
         ).first()
@@ -177,58 +411,14 @@ async def trading_websocket(
         db.close()
         
     is_india   = "india" in base_url
-
-    # Delta Exchange (as of April 2026) has TWO separate WS pods:
-    # PUBLIC pod  → ticker, mark_price (no auth needed)
-    # PRIVATE pod → positions, orders, user_balances (auth required)
     private_ws_url = "wss://socket.india.delta.exchange"      if is_india else "wss://socket.delta.exchange"
     public_ws_url  = "wss://public-socket.india.delta.exchange" if is_india else "wss://socket.delta.exchange"
 
     print(f"SUCCESS: Using Private={private_ws_url}")
     print(f"SUCCESS: Using Public={public_ws_url}")
 
-    # Shared state
     alive = {"browser": True}
-    # Queue for messages from browser iframe → we process them here
     inbox = asyncio.Queue()
-
-    await websocket.send_json({"type": "connected", "message": "Connecting to Delta Exchange..."})
-
-    # ──────────────────────────────────────────────────────────────────
-    # TASK 1: Read all browser messages into queue (single receiver)
-    # ──────────────────────────────────────────────────────────────────
-    def update_global_cache(raw: str, b_id: int = None):
-        try:
-            msg = json.loads(raw)
-            t = msg.get("type", "")
-            payload = msg.get("payload", [])
-            if not isinstance(payload, list):
-                payload = [payload]
-
-            if t in ["mark_price", "v2/mark_price", "ticker", "v2/ticker"]:
-                symbol = msg.get("symbol") or (payload[0].get("symbol") if payload and isinstance(payload[0], dict) else None)
-                price = msg.get("price") or (payload[0].get("mark_price") if payload and isinstance(payload[0], dict) else None) or (payload[0].get("price") if payload and isinstance(payload[0], dict) else None)
-                if symbol and price:
-                    global_cache.update_price(symbol, float(price))
-            
-            elif t in ["user_balances", "v2/user_balances", "wallets", "v2/wallets"] and b_id:
-                bals = {}
-                for b in payload:
-                    if not isinstance(b, dict): continue
-                    sym = b.get("asset_symbol") or b.get("symbol")
-                    if sym:
-                        bals[sym] = b
-                global_cache.update_balances(b_id, bals)
-
-            elif t in ["positions", "v2/positions"] and b_id:
-                for p in payload:
-                    if not isinstance(p, dict): continue
-                    pid = p.get("product_id")
-                    if pid:
-                        uk = f"{pid}_{b_id}"
-                        global_cache.update_position(uk, p)
-        except Exception as e:
-            print(f"DEBUG: Cache update error: {e}")
 
     async def browser_reader():
         try:
@@ -238,106 +428,7 @@ async def trading_websocket(
         except (WebSocketDisconnect, Exception) as e:
             print(f"DEBUG: Browser disconnected: {e}")
             alive["browser"] = False
-            await inbox.put(None)  # Sentinel to unblock processors
-
-    # ──────────────────────────────────────────────────────────────────
-    # TASK 2: Stream public ticker (spot price + options) → browser
-    # ──────────────────────────────────────────────────────────────────
-    async def stream_public(symbols: list):
-        """Subscribe to Delta public WS and forward all ticker messages to browser."""
-        print(f"DEBUG: Public WS connecting for symbols: {symbols}")
-        retry = 2
-        while alive["browser"]:
-            try:
-                async with websockets.connect(
-                    public_ws_url, ping_interval=20, ping_timeout=10, open_timeout=15
-                ) as pub_ws:
-                    await pub_ws.send(json.dumps({
-                        "type": "subscribe",
-                        "payload": {"channels": [{"name": "ticker", "symbols": symbols}]}
-                    }))
-                    print(f"SUCCESS: Public WS live. Streaming ticker for: {symbols}")
-                    async for raw in pub_ws:
-                        if not alive["browser"]:
-                            return
-                        try:
-                            update_global_cache(raw)
-                            await websocket.send_text(raw)
-                        except Exception:
-                            alive["browser"] = False
-                            return
-                retry = 2
-            except Exception as e:
-                print(f"DEBUG: Public WS error ({e}), retry in {retry}s")
-                await asyncio.sleep(retry)
-                retry = min(retry * 2, 30)
-
-    # ──────────────────────────────────────────────────────────────────
-    # TASK 3: Private WS (user data) — auth + subscribe + forward
-    # ──────────────────────────────────────────────────────────────────
-    async def stream_private():
-        retry = 3
-        while alive["browser"]:
-            print(f"DEBUG: Private WS connecting...")
-            try:
-                async with websockets.connect(
-                    private_ws_url, ping_interval=20, ping_timeout=10, open_timeout=15
-                ) as priv_ws:
-                    # Auth
-                    ts  = str(int(time.time()))
-                    sig = hmac.new(secret_key.encode(), ("GET" + ts + "/live").encode(), hashlib.sha256).hexdigest()
-                    await priv_ws.send(json.dumps({
-                        "type": "auth",
-                        "payload": {"api-key": api_key, "signature": sig, "timestamp": ts}
-                    }))
-                    try:
-                        auth_raw = await asyncio.wait_for(priv_ws.recv(), timeout=6.0)
-                        auth_msg = json.loads(auth_raw)
-                        print(f"DEBUG: Auth response: {auth_raw[:200]}")
-                        if auth_msg.get("type") == "error":
-                            err_msg = auth_msg.get("message", "Unknown error")
-                            print(f"ERROR: Delta private WS auth failed: {err_msg}")
-                            await websocket.send_json({
-                                "type": "delta_error",
-                                "message": f"Delta auth failed: {err_msg}"
-                            })
-                            # Don't return — wait and retry (IP whitelist may update)
-                            await asyncio.sleep(30)
-                            continue
-                    except asyncio.TimeoutError:
-                        print("DEBUG: Auth timeout")
-
-                    # Subscribe private channels
-                    await priv_ws.send(json.dumps({
-                        "type": "subscribe",
-                        "payload": {"channels": [
-                            {"name": "user_balances", "symbols": ["all"]},
-                            {"name": "positions", "symbols": ["all"]},
-                            {"name": "orders", "symbols": ["all"]},
-                        ]}
-                    }))
-                    print("SUCCESS: Private WS subscribed: user_balances, positions, orders")
-
-                    # Forward all messages from private WS to browser
-                    async for raw in priv_ws:
-                        if not alive["browser"]:
-                            return
-                        try:
-                            update_global_cache(raw, broker_id)
-                            await websocket.send_text(raw)
-                        except Exception:
-                            alive["browser"] = False
-                            return
-                retry = 3
-            except Exception as e:
-                print(f"DEBUG: Private WS error ({e}), retry in {retry}s")
-                await asyncio.sleep(retry)
-                retry = min(retry * 2, 30)
-
-    # ──────────────────────────────────────────────────────────────────
-    # TASK 4: Process browser messages (subscribe_symbols, trade_signal)
-    # ──────────────────────────────────────────────────────────────────
-    public_tasks = {}  # expiry → task
+            await inbox.put(None)
 
     async def message_processor():
         while alive["browser"]:
@@ -349,15 +440,12 @@ async def trading_websocket(
                 t   = msg.get("type", "")
 
                 if t == "subscribe_symbols":
-                    # Browser iframe sends this when option chain opens
                     symbols    = msg.get("symbols", [])
                     expiry     = msg.get("expiry")
                     underlying = msg.get("underlying", "BTC")
 
-                    # Strip prefixes (ticker:, v2:, etc.) for Delta compatibility
                     pub_syms = []
                     
-                    # Auto-discover options symbols if symbols list is empty but underlying & expiry are provided
                     if not symbols and expiry and underlying:
                         try:
                             normalized_expiry = normalize_expiry_to_ddmmyy(expiry)
@@ -381,33 +469,30 @@ async def trading_websocket(
                     if ".BTCUSD" not in pub_syms:
                         pub_syms.append(".BTCUSD")
 
-                    task_key = expiry or "default"
-                    # Cancel previous task for same key
-                    if task_key in public_tasks:
-                        public_tasks[task_key].cancel()
-
-                    print(f"SUCCESS: Option Chain subscription request → launching public WS for: {pub_syms}")
-                    public_tasks[task_key] = asyncio.create_task(stream_public(pub_syms))
+                    delta_pool.update_symbols(broker_id, pub_syms)
 
                 elif t == "trade_signal":
                     symbol = msg.get("symbol")
                     action = msg.get("action")
                     strike = msg.get("strike")
                     print(f"SUCCESS: Trade Signal → {symbol} ({action}) @ Strike {strike}")
-                    # (relay logic can be added here if needed)
 
             except Exception as e:
                 print(f"DEBUG: Message processor error: {e}")
 
-    # ──────────────────────────────────────────────────────────────────
-    # Launch everything concurrently
-    # ──────────────────────────────────────────────────────────────────
     # Fetch open position symbols for initial public subscription
     open_symbols = await asyncio.to_thread(get_open_symbols, api_key, secret_key, base_url)
 
-    # Initial public subscription: always include .BTCUSD for index spot price
-    initial_pub_syms = [".BTCUSD"] + open_symbols
-    public_tasks["initial"] = asyncio.create_task(stream_public(initial_pub_syms))
+    # Register client in the shared pool
+    await delta_pool.add_client(
+        broker_id=broker_id,
+        ws=websocket,
+        api_key=api_key,
+        secret_key=secret_key,
+        private_url=private_ws_url,
+        public_url=public_ws_url,
+        initial_symbols=open_symbols
+    )
 
     await websocket.send_json({
         "type": "delta_connected",
@@ -415,19 +500,14 @@ async def trading_websocket(
         "symbols": open_symbols,
     })
 
-    # Run all 3 tasks concurrently; exit when browser disconnects
+    # Run browser reader and message processor concurrently for this connection
     await asyncio.gather(
         browser_reader(),
-        stream_private(),
         message_processor(),
         return_exceptions=True
     )
     
+    # Cleanup client on disconnect
+    delta_pool.remove_client(broker_id, websocket)
     manager.disconnect(user.id, websocket)
-
-    # Cleanup all public tasks
-    for task in public_tasks.values():
-        task.cancel()
-
     print(f"DEBUG: WS handler done for broker {broker_id}")
-
