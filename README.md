@@ -76,7 +76,7 @@ sudo systemctl status nginx
 
 cd ~/bitcos_poc
 
-git pull
+git pull origin main
 
 source ~/venv/bin/activate
 

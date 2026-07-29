@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+import asyncio
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from ..database import get_db
@@ -175,33 +176,56 @@ current_user: User = Depends(get_current_active_user)
 
 @router.post("/positions/close-all-brokers")
 async def close_all_positions_all_brokers(
-db: Session = Depends(get_db),
-current_user: User = Depends(get_current_active_user)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    brokers = db.query(Broker).filter(Broker.user_id == current_user.id,Broker.status == "ACTIVE").all()
-    results = []
+    brokers = db.query(Broker).filter(Broker.user_id == current_user.id, Broker.status == "ACTIVE").all()
+    
+    # Prepare API clients in the main thread (fast, no network calls)
+    broker_apis = []
     for broker in brokers:
         try:
             delta_api = get_delta_api(broker.id, current_user.id, db)
-            result = delta_api.close_all_positions()
-            
-            results.append({
+            broker_apis.append((broker, delta_api))
+        except Exception as e:
+            broker_apis.append((broker, e))
+
+    # Helper function to run the network call in a separate thread
+    async def close_broker_task(broker, api_or_err):
+        if isinstance(api_or_err, Exception):
+            return {
+                "broker_id": broker.id,
+                "broker_name": broker.name_tag,
+                "success": False,
+                "message": str(api_or_err)
+            }
+        try:
+            result = await asyncio.to_thread(api_or_err.close_all_positions)
+            return {
                 "broker_id": broker.id,
                 "broker_name": broker.name_tag,
                 "success": result.get("success", True),
-                "message": "Positions closed" if result.get("success", True) else result.get("error")
-            })
-            
-            if result.get("success", True):
-                db.query(Position).filter(Position.broker_id == broker.id).delete()
-                
+                "message": "Positions closed" if result.get("success", True) else str(result.get("error", "Unknown error")),
+                "api_result": result
+            }
         except Exception as e:
-            results.append({
+            return {
                 "broker_id": broker.id,
                 "broker_name": broker.name_tag,
                 "success": False,
                 "message": str(e)
-            })
+            }
+
+    # Run concurrently
+    tasks = [close_broker_task(broker, api_or_err) for broker, api_or_err in broker_apis]
+    results = await asyncio.gather(*tasks)
+
+    # Process database updates in the main thread after all calls complete
+    for res in results:
+        if res.get("success"):
+            db.query(Position).filter(Position.broker_id == res["broker_id"]).delete()
+            if "api_result" in res:
+                del res["api_result"]
 
     db.commit()
     return {"results": results}
@@ -357,16 +381,34 @@ current_user: User = Depends(get_current_active_user)
 
 @router.post("/orders/place-multiple")
 async def place_order_multiple_brokers(
-order: OrderCreate,
-broker_ids: List[int],
-db: Session = Depends(get_db),
-current_user: User = Depends(get_current_active_user)
+    order: OrderCreate,
+    broker_ids: List[int],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    results = []
+    # Prepare API clients and fetch broker names in main thread
+    broker_apis = []
     for broker_id in broker_ids:
+        broker = db.query(Broker).filter(Broker.id == broker_id).first()
+        broker_name = broker.name_tag if broker else "Unknown"
         try:
             delta_api = get_delta_api(broker_id, current_user.id, db)
-            result = delta_api.place_order(
+            broker_apis.append((broker_id, broker_name, delta_api))
+        except Exception as e:
+            broker_apis.append((broker_id, broker_name, e))
+
+    # Helper function to run the network call in a separate thread
+    async def place_order_task(broker_id, broker_name, api_or_err):
+        if isinstance(api_or_err, Exception):
+            return {
+                "broker_id": broker_id,
+                "broker_name": broker_name,
+                "success": False,
+                "message": str(api_or_err)
+            }
+        try:
+            result = await asyncio.to_thread(
+                api_or_err.place_order,
                 order.product_id,
                 order.side,
                 order.order_type,
@@ -374,60 +416,76 @@ current_user: User = Depends(get_current_active_user)
                 order.price,
                 order.stop_price
             )
-            
-            broker = db.query(Broker).filter(Broker.id == broker_id).first()
-            
-            if result.get("success", True):
-                order_data = result.get("result", {})
-                
-                new_order = Order(
-                    broker_id=broker_id,
-                    order_id=order_data.get("id", ""),
-                    symbol=order_data.get("symbol", ""),
-                    product_id=order.product_id,
-                    side=order.side,
-                    order_type=order.order_type,
-                    size=order.size,
-                    price=order.price,
-                    stop_price=order.stop_price,
-                    status=order_data.get("state", "open"),
-                    filled_size=order_data.get("filled_size", 0)
-                )
-                
-                db.add(new_order)
-                
-                results.append({
-                    "broker_id": broker_id,
-                    "broker_name": broker.name_tag if broker else "Unknown",
-                    "success": True,
-                    "order_id": order_data.get("id"),
-                    "message": "Order placed successfully"
-                })
-            else:
-                error_val = result.get("error", "Unknown error")
-                if isinstance(error_val, dict):
-                    error_msg = error_val.get("message") or error_val.get("code") or str(error_val)
-                else:
-                    error_msg = str(error_val)
-                    
-                results.append({
-                    "broker_id": broker_id,
-                    "broker_name": broker.name_tag if broker else "Unknown",
-                    "success": False,
-                    "message": error_msg
-                })
-                
-        except Exception as e:
-            broker = db.query(Broker).filter(Broker.id == broker_id).first()
-            results.append({
+            return {
                 "broker_id": broker_id,
-                "broker_name": broker.name_tag if broker else "Unknown",
+                "broker_name": broker_name,
+                "success": result.get("success", True),
+                "api_result": result
+            }
+        except Exception as e:
+            return {
+                "broker_id": broker_id,
+                "broker_name": broker_name,
                 "success": False,
                 "message": str(e)
+            }
+
+    # Run concurrently
+    tasks = [place_order_task(b_id, name, api) for b_id, name, api in broker_apis]
+    task_results = await asyncio.gather(*tasks)
+
+    # Process database updates in the main thread
+    final_results = []
+    for res in task_results:
+        broker_id = res["broker_id"]
+        broker_name = res["broker_name"]
+        
+        if res.get("success"):
+            api_result = res["api_result"]
+            order_data = api_result.get("result", {})
+            
+            new_order = Order(
+                broker_id=broker_id,
+                order_id=order_data.get("id", ""),
+                symbol=order_data.get("symbol", ""),
+                product_id=order.product_id,
+                side=order.side,
+                order_type=order.order_type,
+                size=order.size,
+                price=order.price,
+                stop_price=order.stop_price,
+                status=order_data.get("state", "open"),
+                filled_size=order_data.get("filled_size", 0)
+            )
+            db.add(new_order)
+            
+            final_results.append({
+                "broker_id": broker_id,
+                "broker_name": broker_name,
+                "success": True,
+                "order_id": order_data.get("id"),
+                "message": "Order placed successfully"
+            })
+        else:
+            # If api call failed, extract message
+            msg = res.get("message")
+            if not msg and "api_result" in res:
+                api_result = res["api_result"]
+                error_val = api_result.get("error", "Unknown error")
+                if isinstance(error_val, dict):
+                    msg = error_val.get("message") or error_val.get("code") or str(error_val)
+                else:
+                    msg = str(error_val)
+                    
+            final_results.append({
+                "broker_id": broker_id,
+                "broker_name": broker_name,
+                "success": False,
+                "message": msg or "Failed placing order"
             })
 
     db.commit()
-    return {"results": results}
+    return {"results": final_results}
 
 @router.get("/profile/{broker_id}")
 async def get_broker_profile(
