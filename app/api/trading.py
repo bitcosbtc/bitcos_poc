@@ -82,37 +82,59 @@ async def get_positions(
 
 @router.get("/positions/all/summary")
 async def get_all_positions_summary(
-db: Session = Depends(get_db),
-current_user: User = Depends(get_current_active_user)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
     try:
-        brokers = db.query(Broker).filter(Broker.user_id == current_user.id,Broker.status == "ACTIVE").all()
-        all_positions = []
-        total_upnl = 0.0
-
+        brokers = db.query(Broker).filter(Broker.user_id == current_user.id, Broker.status == "ACTIVE").all()
+        
+        # Prepare API clients in the main thread (fast, no network calls)
+        broker_apis = []
         for broker in brokers:
             try:
                 delta_api = get_delta_api(broker.id, current_user.id, db)
-                positions_data = delta_api.get_positions()
-                
+                broker_apis.append((broker, delta_api))
+            except Exception as e:
+                broker_apis.append((broker, e))
+
+        # Helper function to run the network call in a separate thread
+        async def fetch_broker_positions(broker, api_or_err):
+            if isinstance(api_or_err, Exception):
+                print(f"Error initializing API for broker {broker.id}: {api_or_err}")
+                return []
+            try:
+                positions_data = await asyncio.to_thread(api_or_err.get_positions)
                 if positions_data.get("success", True):
                     broker_positions = positions_data.get("result", [])
                     print(f"DEBUG: Processing positions for broker {broker.id} (v2.1-robust)")
                     for pos in broker_positions:
                         pos["broker_name"] = broker.name_tag
                         pos["broker_id"] = broker.id
-                        # Defensive casting for strings/floats/commas
-                        raw_pnl = pos.get("unrealized_pnl", 0)
-                        try:
-                            val = float(str(raw_pnl or 0).replace(',', ''))
-                            total_upnl += val
-                        except (ValueError, TypeError):
-                            print(f"DEBUG: Failed to cast PnL '{raw_pnl}' to float")
-                    
-                    all_positions.extend(broker_positions)
+                    return broker_positions
+                else:
+                    print(f"Error fetching positions for broker {broker.id}: {positions_data.get('error')}")
+                    return []
             except Exception as e:
-                print(f"Error fetching positions for broker {broker.id}: {str(e)}")
-                continue
+                print(f"Exception fetching positions for broker {broker.id}: {str(e)}")
+                return []
+
+        # Run concurrently
+        tasks = [fetch_broker_positions(broker, api_or_err) for broker, api_or_err in broker_apis]
+        tasks_results = await asyncio.gather(*tasks)
+
+        # Accumulate results in the main thread
+        all_positions = []
+        total_upnl = 0.0
+        
+        for broker_positions in tasks_results:
+            all_positions.extend(broker_positions)
+            for pos in broker_positions:
+                raw_pnl = pos.get("unrealized_pnl", 0)
+                try:
+                    val = float(str(raw_pnl or 0).replace(',', ''))
+                    total_upnl += val
+                except (ValueError, TypeError):
+                    print(f"DEBUG: Failed to cast PnL '{raw_pnl}' to float")
 
         return {
             "positions": all_positions,
