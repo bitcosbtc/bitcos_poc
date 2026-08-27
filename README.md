@@ -145,6 +145,122 @@ sequenceDiagram
 5. **Rate-Limit Prevention:** Serves 10+ browser windows concurrently without increasing outbound network requests to Delta Exchange.
 
 
+## Close Option Positions by Type (Call/Put) API
+
+We have added a dedicated endpoint to close option positions selectively based on their type (`call` or `put`). This API supports:
+1. **Single Broker Account**
+2. **Multiple Broker Accounts (Select list)**
+3. **All Active Broker Accounts**
+
+### Endpoint Specification
+* **Endpoint:** `POST /api/trading/positions/close-option-type`
+* **Headers:**
+  ```http
+  Authorization: Bearer <JWT_TOKEN>
+  Content-Type: application/json
+  ```
+
+### Usage Scenarios (Payload Examples)
+
+#### Scenario A: Close Call options across ALL active accounts
+```json
+{
+  "option_type": "call"
+}
+```
+
+#### Scenario B: Close Put options for a SPECIFIC broker (e.g., broker_id = 15)
+```json
+{
+  "option_type": "put",
+  "broker_id": 15
+}
+```
+
+#### Scenario C: Close Call options for a SPECIFIC LIST of brokers (e.g., broker_id = 15 & 16)
+```json
+{
+  "option_type": "call",
+  "broker_ids": [15, 16]
+}
+```
+
+### Response Example
+```json
+{
+  "results": [
+    {
+      "broker_id": 15,
+      "broker_name": "ankit-account-1",
+      "success": true,
+      "closed_count": 2,
+      "closed_positions": ["BTC-270626-68000-C", "ETH-270626-3500-C"]
+    },
+    {
+      "broker_id": 16,
+      "broker_name": "ankit-account-2",
+      "success": true,
+      "closed_count": 0,
+      "closed_positions": []
+    }
+  ]
+}
+```
 
 
+## Update Trailing Stop Loss Bracket Order API
+
+These endpoints allow modifying the `bracket_trail_amount` for active stop loss bracket orders. Successful requests update the backend memory cache (`global_cache.orders`) so subsequent GET queries reflect changes instantly.
+
+### 1. Single Account Update
+* **Endpoint:** `PUT /api/trading/orders/bracket/{broker_id}`
+* **Payload:**
+  ```json
+  {
+    "id": 34521712,            // Stop order / bracket order ID on Delta
+    "product_id": 27,          // Product ID
+    "bracket_trail_amount": 50.0
+  }
+  ```
+* **Response Example:**
+  ```json
+  {
+    "success": true,
+    "message": "Bracket order updated successfully",
+    "data": { ... }
+  }
+  ```
+
+### 2. Multiple Accounts Batch Update (Concurrently executed)
+* **Endpoint:** `PUT /api/trading/orders/bracket/batch`
+* **Payload:**
+  ```json
+  {
+    "product_id": 27,
+    "bracket_trail_amount": 50.0,
+    "targets": [
+      { "broker_id": 15, "order_id": 34521712 },
+      { "broker_id": 16, "order_id": 98765432 }
+    ]
+  }
+  ```
+* **Response Example:**
+  ```json
+  {
+    "results": [
+      {
+        "broker_id": 15,
+        "order_id": 34521712,
+        "success": true,
+        "message": "Updated"
+      },
+      {
+        "broker_id": 16,
+        "order_id": 98765432,
+        "success": true,
+        "message": "Updated"
+      }
+    ]
+  }
+  ```
 

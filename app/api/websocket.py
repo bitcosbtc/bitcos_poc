@@ -155,6 +155,13 @@ def update_global_cache(raw: str, b_id: int = None):
                 if pid:
                     uk = f"{pid}_{b_id}"
                     global_cache.update_position(uk, p)
+            global_cache.set_positions_warmed(b_id)
+
+        elif t in ["orders", "v2/orders"] and b_id:
+            for o in payload:
+                if not isinstance(o, dict): continue
+                global_cache.update_order(b_id, o)
+            global_cache.set_orders_warmed(b_id)
     except Exception as e:
         print(f"DEBUG: Cache update error: {e}")
 
@@ -172,6 +179,20 @@ class DeltaConnectionPool:
         self.public_symbols: dict[int, set[str]] = {}
         # broker_id -> asyncio Queue to send subscription updates to the public WS task
         self.public_subscription_queues: dict[int, asyncio.Queue] = {}
+        # Rate-limiting variables to enforce staggering
+        self.last_connection_time: float = 0.0
+        self.connection_lock: asyncio.Lock = asyncio.Lock()
+
+    async def throttle_connection(self):
+        """Enforces a minimum 250ms gap between starting new WS connections."""
+        async with self.connection_lock:
+            now = time.time()
+            elapsed = now - self.last_connection_time
+            if elapsed < 0.25:  # 250ms gap
+                delay = 0.25 - elapsed
+                await asyncio.sleep(delay)
+            self.last_connection_time = time.time()
+
 
     async def broadcast_raw(self, broker_id: int, message: str):
         if broker_id in self.clients:
@@ -249,6 +270,7 @@ class DeltaConnectionPool:
     async def stream_private_shared(self, broker_id: int, api_key: str, secret_key: str, url: str):
         retry = 3
         while broker_id in self.clients and len(self.clients[broker_id]) > 0:
+            await self.throttle_connection()
             print(f"DEBUG: Shared Private WS connecting for broker {broker_id}...")
             try:
                 async with websockets.connect(
@@ -306,6 +328,7 @@ class DeltaConnectionPool:
     async def stream_public_shared(self, broker_id: int, url: str):
         retry = 2
         while broker_id in self.clients and len(self.clients[broker_id]) > 0:
+            await self.throttle_connection()
             print(f"DEBUG: Shared Public WS connecting for broker {broker_id}...")
             try:
                 queue = self.public_subscription_queues.get(broker_id)
