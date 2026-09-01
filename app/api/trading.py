@@ -13,7 +13,6 @@ from ..schemas.order import OrderCreate
 from ..schemas.mtm import MTMSettingsUpdate, MTMSettingsResponse
 from ..services.encryption import encryption_service
 from ..services.delta_exchange import DeltaExchangeAPI
-from ..services.cache import global_cache
 from .auth import get_current_active_user
 
 router = APIRouter(prefix="/api/trading", tags=["Trading"])
@@ -39,15 +38,6 @@ async def get_positions(
     current_user: User = Depends(get_current_active_user)
 ):
     try:
-        # Check cache first
-        if broker_id in global_cache.positions_warmed:
-            positions_list = []
-            for key, pos in global_cache.positions.items():
-                if str(key).endswith(f"_{broker_id}"):
-                    positions_list.append(pos)
-            return {"success": True, "result": positions_list}
-
-        # Fallback to REST API call
         delta_api = get_delta_api(broker_id, current_user.id, db)
         positions_data = delta_api.get_positions()
         
@@ -80,15 +70,8 @@ async def get_positions(
                         unrealized_pnl=pos.get("unrealized_pnl", 0)
                     )
                     db.add(new_pos)
-                
-                # Also update global cache
-                pid = pos.get("product_id")
-                if pid:
-                    uk = f"{pid}_{broker_id}"
-                    global_cache.update_position(uk, pos)
         
             db.commit()
-            global_cache.set_positions_warmed(broker_id)
             return positions_data
         else:
             raise HTTPException(status_code=400, detail=positions_data.get("error"))
@@ -105,78 +88,53 @@ async def get_all_positions_summary(
     try:
         brokers = db.query(Broker).filter(Broker.user_id == current_user.id, Broker.status == "ACTIVE").all()
         
-        all_positions = []
-        unwarmed_brokers = []
-        
-        # Load from cache where available
+        # Prepare API clients in the main thread (fast, no network calls)
+        broker_apis = []
         for broker in brokers:
-            if broker.id in global_cache.positions_warmed:
-                broker_positions = []
-                for key, pos in global_cache.positions.items():
-                    if str(key).endswith(f"_{broker.id}"):
-                        copied_pos = pos.copy()
-                        copied_pos["broker_name"] = broker.name_tag
-                        copied_pos["broker_id"] = broker.id
-                        broker_positions.append(copied_pos)
-                all_positions.extend(broker_positions)
-            else:
-                unwarmed_brokers.append(broker)
-                
-        # Resolve any unwarmed brokers via fallback REST API
-        if unwarmed_brokers:
-            broker_apis = []
-            for broker in unwarmed_brokers:
-                try:
-                    delta_api = get_delta_api(broker.id, current_user.id, db)
-                    broker_apis.append((broker, delta_api))
-                except Exception as e:
-                    broker_apis.append((broker, e))
-
-            # Helper function to run the network call in a separate thread
-            async def fetch_broker_positions(broker, api_or_err):
-                if isinstance(api_or_err, Exception):
-                    print(f"Error initializing API for broker {broker.id}: {api_or_err}")
-                    return []
-                try:
-                    positions_data = await asyncio.to_thread(api_or_err.get_positions)
-                    if positions_data.get("success", True):
-                        broker_positions = positions_data.get("result", [])
-                        print(f"DEBUG: Processing positions for broker {broker.id} (v2.1-robust)")
-                        for pos in broker_positions:
-                            pos["broker_name"] = broker.name_tag
-                            pos["broker_id"] = broker.id
-                            
-                            # Update global cache
-                            pid = pos.get("product_id")
-                            if pid:
-                                uk = f"{pid}_{broker.id}"
-                                global_cache.update_position(uk, pos)
-                                
-                        global_cache.set_positions_warmed(broker.id)
-                        return broker_positions
-                    else:
-                        print(f"Error fetching positions for broker {broker.id}: {positions_data.get('error')}")
-                        return []
-                except Exception as e:
-                    print(f"Exception fetching positions for broker {broker.id}: {str(e)}")
-                    return []
-
-            # Run concurrently
-            tasks = [fetch_broker_positions(broker, api_or_err) for broker, api_or_err in broker_apis]
-            tasks_results = await asyncio.gather(*tasks)
-
-            for broker_positions in tasks_results:
-                all_positions.extend(broker_positions)
-
-        # Calculate total unrealized PnL
-        total_upnl = 0.0
-        for pos in all_positions:
-            raw_pnl = pos.get("unrealized_pnl", 0)
             try:
-                val = float(str(raw_pnl or 0).replace(',', ''))
-                total_upnl += val
-            except (ValueError, TypeError):
-                print(f"DEBUG: Failed to cast PnL '{raw_pnl}' to float")
+                delta_api = get_delta_api(broker.id, current_user.id, db)
+                broker_apis.append((broker, delta_api))
+            except Exception as e:
+                broker_apis.append((broker, e))
+
+        # Helper function to run the network call in a separate thread
+        async def fetch_broker_positions(broker, api_or_err):
+            if isinstance(api_or_err, Exception):
+                print(f"Error initializing API for broker {broker.id}: {api_or_err}")
+                return []
+            try:
+                positions_data = await asyncio.to_thread(api_or_err.get_positions)
+                if positions_data.get("success", True):
+                    broker_positions = positions_data.get("result", [])
+                    print(f"DEBUG: Processing positions for broker {broker.id} (v2.1-robust)")
+                    for pos in broker_positions:
+                        pos["broker_name"] = broker.name_tag
+                        pos["broker_id"] = broker.id
+                    return broker_positions
+                else:
+                    print(f"Error fetching positions for broker {broker.id}: {positions_data.get('error')}")
+                    return []
+            except Exception as e:
+                print(f"Exception fetching positions for broker {broker.id}: {str(e)}")
+                return []
+
+        # Run concurrently
+        tasks = [fetch_broker_positions(broker, api_or_err) for broker, api_or_err in broker_apis]
+        tasks_results = await asyncio.gather(*tasks)
+
+        # Accumulate results in the main thread
+        all_positions = []
+        total_upnl = 0.0
+        
+        for broker_positions in tasks_results:
+            all_positions.extend(broker_positions)
+            for pos in broker_positions:
+                raw_pnl = pos.get("unrealized_pnl", 0)
+                try:
+                    val = float(str(raw_pnl or 0).replace(',', ''))
+                    total_upnl += val
+                except (ValueError, TypeError):
+                    print(f"DEBUG: Failed to cast PnL '{raw_pnl}' to float")
 
         return {
             "positions": all_positions,
@@ -640,42 +598,16 @@ async def get_options_chain(
 
 @router.get("/orders/{broker_id}")
 async def get_orders(
-    broker_id: int,
-    product_id: Optional[int] = None,
-    state: Optional[str] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+broker_id: int,
+product_id: Optional[int] = None,
+state: Optional[str] = None,
+db: Session = Depends(get_db),
+current_user: User = Depends(get_current_active_user)
 ):
     try:
-        # Check cache first
-        if broker_id in global_cache.orders_warmed:
-            orders_dict = global_cache.orders.get(broker_id, {})
-            orders_list = list(orders_dict.values())
-            if product_id is not None:
-                orders_list = [o for o in orders_list if o.get("product_id") == product_id]
-            if state is not None:
-                orders_list = [o for o in orders_list if o.get("state") == state]
-            return {"success": True, "result": orders_list}
-
-        # Fallback to REST API call
         delta_api = get_delta_api(broker_id, current_user.id, db)
-        orders_data = delta_api.get_orders()
-        
-        if orders_data.get("success", True):
-            for o in orders_data.get("result", []):
-                global_cache.update_order(broker_id, o)
-            global_cache.set_orders_warmed(broker_id)
-            
-            # Now filter the cached list for the final response
-            orders_dict = global_cache.orders.get(broker_id, {})
-            orders_list = list(orders_dict.values())
-            if product_id is not None:
-                orders_list = [o for o in orders_list if o.get("product_id") == product_id]
-            if state is not None:
-                orders_list = [o for o in orders_list if o.get("state") == state]
-            return {"success": True, "result": orders_list}
-        else:
-            return orders_data
+        orders_data = delta_api.get_orders(product_id, state=state)
+        return orders_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -766,14 +698,6 @@ async def get_wallet(
     current_user: User = Depends(get_current_active_user)
 ):
     try:
-        # Check cache first
-        if broker_id in global_cache.balances_warmed:
-            cached_bal = global_cache.balances.get(broker_id, {})
-            # Only return USD/USDT balances as previously specified
-            filtered_balances = {k: v for k, v in cached_bal.items() if k in ["USD", "USDT"]}
-            return {"success": True, "result": filtered_balances}
-
-        # Fallback to REST API call
         delta_api = get_delta_api(broker_id, current_user.id, db)
         assets_res = delta_api.get_assets()
         
@@ -803,8 +727,6 @@ async def get_wallet(
                 # IMPORTANT: DO NOT swallow errors! Forward to frontend for whitelist checks
                 return {"success": False, "error": bal_res.get("error")}
                 
-        # Warm the cache
-        global_cache.update_balances(broker_id, balances)
         return {"success": True, "result": balances}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -872,194 +794,4 @@ async def update_mtm_settings(
     db.commit()
     db.refresh(settings)
     return settings
-
-
-from pydantic import BaseModel
-
-class CloseOptionTypeRequest(BaseModel):
-    option_type: str  # "call" or "put"
-    broker_id: Optional[int] = None
-    broker_ids: Optional[List[int]] = None
-
-@router.post("/positions/close-option-type")
-async def close_positions_by_option_type(
-    req: CloseOptionTypeRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    option_type = req.option_type.lower()
-    if option_type not in ["call", "put"]:
-        raise HTTPException(status_code=400, detail="Invalid option_type. Must be 'call' or 'put'")
-        
-    # Get active brokers
-    if req.broker_ids is not None:
-        brokers = db.query(Broker).filter(
-            Broker.id.in_(req.broker_ids),
-            Broker.user_id == current_user.id,
-            Broker.status == "ACTIVE"
-        ).all()
-    elif req.broker_id is not None:
-        brokers = db.query(Broker).filter(
-            Broker.id == req.broker_id,
-            Broker.user_id == current_user.id,
-            Broker.status == "ACTIVE"
-        ).all()
-    else:
-        brokers = db.query(Broker).filter(
-            Broker.user_id == current_user.id,
-            Broker.status == "ACTIVE"
-        ).all()
-        
-    results = []
-    
-    for broker in brokers:
-        try:
-            delta_api = get_delta_api(broker.id, current_user.id, db)
-            
-            # Fetch active positions from cache if warmed, otherwise from REST fallback
-            positions = []
-            if broker.id in global_cache.positions_warmed:
-                for key, pos in global_cache.positions.items():
-                    if str(key).endswith(f"_{broker.id}"):
-                        positions.append(pos)
-            else:
-                pos_res = delta_api.get_positions()
-                if pos_res.get("success", True):
-                    positions = pos_res.get("result", [])
-                    # Warm cache
-                    for pos in positions:
-                        pid = pos.get("product_id")
-                        if pid:
-                            global_cache.update_position(f"{pid}_{broker.id}", pos)
-                    global_cache.set_positions_warmed(broker.id)
-            
-            # Filter positions matching option_type
-            positions_to_close = []
-            for pos in positions:
-                symbol = pos.get("symbol", "").upper()
-                size = float(pos.get("size", 0))
-                if size == 0:
-                    continue
-                    
-                is_call = symbol.endswith("-C")
-                is_put = symbol.endswith("-P")
-                
-                if option_type == "call" and is_call:
-                    positions_to_close.append(pos)
-                elif option_type == "put" and is_put:
-                    positions_to_close.append(pos)
-            
-            closed_symbols = []
-            for pos in positions_to_close:
-                pid = pos.get("product_id")
-                # Call Delta REST API to close this specific position
-                close_res = delta_api.close_position(pid)
-                if close_res.get("success", True):
-                    closed_symbols.append(pos.get("symbol"))
-                    # Delete from database
-                    db.query(Position).filter(
-                        Position.broker_id == broker.id,
-                        Position.product_id == pid
-                    ).delete()
-                    # Remove from cache
-                    cache_key = f"{pid}_{broker.id}"
-                    if cache_key in global_cache.positions:
-                        del global_cache.positions[cache_key]
-                        
-            db.commit()
-            results.append({
-                "broker_id": broker.id,
-                "broker_name": broker.name_tag,
-                "success": True,
-                "closed_count": len(closed_symbols),
-                "closed_positions": closed_symbols
-            })
-        except Exception as e:
-            results.append({
-                "broker_id": broker.id,
-                "broker_name": broker.name_tag,
-                "success": False,
-                "message": str(e)
-            })
-            
-    return {"results": results}
-
-
-class BracketOrderUpdateRequest(BaseModel):
-    id: int
-    product_id: int
-    bracket_trail_amount: float
-
-class BracketOrderBatchTarget(BaseModel):
-    broker_id: int
-    order_id: int
-
-class BracketOrderBatchUpdateRequest(BaseModel):
-    product_id: int
-    bracket_trail_amount: float
-    targets: List[BracketOrderBatchTarget]
-
-@router.put("/orders/bracket/{broker_id}")
-async def update_single_broker_bracket_order(
-    broker_id: int,
-    req: BracketOrderUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    try:
-        delta_api = get_delta_api(broker_id, current_user.id, db)
-        result = delta_api.update_bracket_order(
-            order_id=req.id,
-            product_id=req.product_id,
-            bracket_trail_amount=req.bracket_trail_amount
-        )
-        
-        if result.get("success", True) and "error" not in result:
-            # Synchronize memory cache
-            orders_dict = global_cache.orders.get(broker_id, {})
-            order_key = str(req.id)
-            if order_key in orders_dict:
-                orders_dict[order_key]["bracket_trail_amount"] = str(req.bracket_trail_amount)
-            
-            return {"success": True, "message": "Bracket order updated successfully", "data": result}
-        else:
-            raise HTTPException(status_code=400, detail=result.get("error", "Unknown Delta Exchange error"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.put("/orders/bracket/batch")
-async def update_batch_broker_bracket_orders(
-    req: BracketOrderBatchUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    async def update_target(target: BracketOrderBatchTarget):
-        try:
-            delta_api = get_delta_api(target.broker_id, current_user.id, db)
-            result = await asyncio.to_thread(
-                delta_api.update_bracket_order,
-                order_id=target.order_id,
-                product_id=req.product_id,
-                bracket_trail_amount=req.bracket_trail_amount
-            )
-            
-            if result.get("success", True) and "error" not in result:
-                # Synchronize memory cache
-                orders_dict = global_cache.orders.get(target.broker_id, {})
-                order_key = str(target.order_id)
-                if order_key in orders_dict:
-                    orders_dict[order_key]["bracket_trail_amount"] = str(req.bracket_trail_amount)
-                    
-                return {"broker_id": target.broker_id, "order_id": target.order_id, "success": True, "message": "Updated"}
-            else:
-                return {"broker_id": target.broker_id, "order_id": target.order_id, "success": False, "message": result.get("error", "Error")}
-        except Exception as e:
-            return {"broker_id": target.broker_id, "order_id": target.order_id, "success": False, "message": str(e)}
-
-    tasks = [update_target(t) for t in req.targets]
-    results = await asyncio.gather(*tasks)
-    
-    return {"results": results}
-
-
 

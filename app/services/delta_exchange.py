@@ -230,12 +230,3 @@ class DeltaExchangeAPI:
             "leverage": str(leverage)
         }
         return self._make_request("POST", "/v2/orders/leverage", payload)
-
-    def update_bracket_order(self, order_id: int, product_id: int, bracket_trail_amount: float) -> Dict:
-        payload = {
-            "id": int(order_id),
-            "product_id": int(product_id),
-            "bracket_trail_amount": str(bracket_trail_amount)
-        }
-        return self._make_request("PUT", "/v2/orders/bracket", payload)
-
