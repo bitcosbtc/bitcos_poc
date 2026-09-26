@@ -145,6 +145,110 @@ sequenceDiagram
 5. **Rate-Limit Prevention:** Serves 10+ browser windows concurrently without increasing outbound network requests to Delta Exchange.
 
 
+## Close Option Positions by Type (Call/Put) API
+
+Allows selectively closing only **Call** (`-C`) or only **Put** (`-P`) option positions for a single broker, a list of brokers, or across all active brokers.
+
+* **Endpoint:** `POST /api/trading/positions/close-option-type`
+* **Request Payload Examples:**
+
+  **1. Close Calls for specific brokers:**
+  ```json
+  {
+    "option_type": "call",
+    "broker_ids": [15, 16]
+  }
+  ```
+
+  **2. Close Puts for a single broker:**
+  ```json
+  {
+    "option_type": "put",
+    "broker_id": 15
+  }
+  ```
+
+  **3. Close Calls across ALL active brokers:**
+  ```json
+  {
+    "option_type": "call"
+  }
+  ```
+
+* **Response Example:**
+  ```json
+  {
+    "results": [
+      {
+        "broker_id": 15,
+        "broker_name": "ankit-account-1",
+        "success": true,
+        "closed_count": 2,
+        "closed_positions": ["BTC-270626-68000-C", "ETH-270626-3500-C"]
+      }
+    ]
+  }
+  ```
+
+
+## Update Trailing Stop Loss Bracket Order API
+
+These endpoints allow modifying the `bracket_trail_amount` for active stop loss bracket orders.
+
+### 1. Single Account Update
+* **Endpoint:** `PUT /api/trading/orders/bracket/{broker_id}`
+* **Payload:**
+  ```json
+  {
+    "id": 34521712,
+    "product_id": 27,
+    "bracket_trail_amount": 50.0
+  }
+  ```
+* **Response Example:**
+  ```json
+  {
+    "success": true,
+    "message": "Bracket order updated successfully",
+    "data": { ... }
+  }
+  ```
+
+### 2. Multiple Accounts Batch Update (Concurrently executed)
+* **Endpoint:** `PUT /api/trading/orders/bracket/batch`
+* **Payload:**
+  ```json
+  {
+    "product_id": 27,
+    "bracket_trail_amount": 50.0,
+    "targets": [
+      { "broker_id": 15, "order_id": 34521712 },
+      { "broker_id": 16, "order_id": 98765432 }
+    ]
+  }
+  ```
+* **Response Example:**
+  ```json
+  {
+    "results": [
+      {
+        "broker_id": 15,
+        "order_id": 34521712,
+        "success": true,
+        "message": "Updated"
+      },
+      {
+        "broker_id": 16,
+        "order_id": 98765432,
+        "success": true,
+        "message": "Updated"
+      }
+    ]
+  }
+  ```
+
+
+
 
 
 

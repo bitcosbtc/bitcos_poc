@@ -699,37 +699,13 @@ async def get_wallet(
 ):
     try:
         delta_api = get_delta_api(broker_id, current_user.id, db)
-        assets_res = delta_api.get_assets()
-        
-        if not assets_res.get("success"):
-            return {"success": False, "error": assets_res.get("error")}
-            
-        assets = assets_res.get("result", [])
-        balances = {}
-        
-        # To fix the slow connection time, ONLY fetch balances for USD or USDT instead of all 100+ crypto assets
-        for asset in assets:
-            symbol = asset.get("symbol")
-            if symbol not in ["USD", "USDT"]:
-                continue
-                
-            asset_id = asset.get("id")
-            
-            # Just fetch the balances for this asset_id
-            bal_res = delta_api.get_wallet_balances(asset_id)
-            if bal_res.get("success"):
-                result_list = bal_res.get("result", [])
-                
-                # The API returns a list, find the one matching our asset_id
-                filtered = [w for w in result_list if w.get("asset_id") == asset_id]
-                balances[symbol] = filtered[0] if filtered else None
-            else:
-                # IMPORTANT: DO NOT swallow errors! Forward to frontend for whitelist checks
-                return {"success": False, "error": bal_res.get("error")}
-                
-        return {"success": True, "result": balances}
+        bal_res = delta_api.get_wallet_balances()
+        if bal_res.get("success", True) and "error" not in bal_res:
+            return bal_res
+        return {"success": False, "error": bal_res.get("error")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @router.get("/fills/{broker_id}")
@@ -794,4 +770,160 @@ async def update_mtm_settings(
     db.commit()
     db.refresh(settings)
     return settings
+
+
+from pydantic import BaseModel
+
+class CloseOptionTypeRequest(BaseModel):
+    option_type: str  # "call" or "put"
+    broker_id: Optional[int] = None
+    broker_ids: Optional[List[int]] = None
+
+@router.post("/positions/close-option-type")
+async def close_positions_by_option_type(
+    req: CloseOptionTypeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    option_type = req.option_type.lower()
+    if option_type not in ["call", "put"]:
+        raise HTTPException(status_code=400, detail="Invalid option_type. Must be 'call' or 'put'")
+        
+    # Get active brokers
+    if req.broker_ids is not None:
+        brokers = db.query(Broker).filter(
+            Broker.id.in_(req.broker_ids),
+            Broker.user_id == current_user.id,
+            Broker.status == "ACTIVE"
+        ).all()
+    elif req.broker_id is not None:
+        brokers = db.query(Broker).filter(
+            Broker.id == req.broker_id,
+            Broker.user_id == current_user.id,
+            Broker.status == "ACTIVE"
+        ).all()
+    else:
+        brokers = db.query(Broker).filter(
+            Broker.user_id == current_user.id,
+            Broker.status == "ACTIVE"
+        ).all()
+        
+    results = []
+    
+    for broker in brokers:
+        try:
+            delta_api = get_delta_api(broker.id, current_user.id, db)
+            pos_res = delta_api.get_positions()
+            positions = pos_res.get("result", []) if pos_res.get("success", True) else []
+            
+            # Filter positions matching option_type
+            positions_to_close = []
+            for pos in positions:
+                symbol = pos.get("symbol", "").upper()
+                size = float(pos.get("size", 0))
+                if size == 0:
+                    continue
+                    
+                is_call = symbol.endswith("-C")
+                is_put = symbol.endswith("-P")
+                
+                if option_type == "call" and is_call:
+                    positions_to_close.append(pos)
+                elif option_type == "put" and is_put:
+                    positions_to_close.append(pos)
+            
+            closed_symbols = []
+            for pos in positions_to_close:
+                pid = pos.get("product_id")
+                close_res = delta_api.close_position(pid)
+                if close_res.get("success", True):
+                    closed_symbols.append(pos.get("symbol"))
+                    db.query(Position).filter(
+                        Position.broker_id == broker.id,
+                        Position.product_id == pid
+                    ).delete()
+                        
+            db.commit()
+            results.append({
+                "broker_id": broker.id,
+                "broker_name": broker.name_tag,
+                "success": True,
+                "closed_count": len(closed_symbols),
+                "closed_positions": closed_symbols
+            })
+        except Exception as e:
+            results.append({
+                "broker_id": broker.id,
+                "broker_name": broker.name_tag,
+                "success": False,
+                "message": str(e)
+            })
+            
+    return {"results": results}
+
+
+class BracketOrderUpdateRequest(BaseModel):
+    id: int
+    product_id: int
+    bracket_trail_amount: float
+
+class BracketOrderBatchTarget(BaseModel):
+    broker_id: int
+    order_id: int
+
+class BracketOrderBatchUpdateRequest(BaseModel):
+    product_id: int
+    bracket_trail_amount: float
+    targets: List[BracketOrderBatchTarget]
+
+@router.put("/orders/bracket/{broker_id}")
+async def update_single_broker_bracket_order(
+    broker_id: int,
+    req: BracketOrderUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    try:
+        delta_api = get_delta_api(broker_id, current_user.id, db)
+        result = delta_api.update_bracket_order(
+            order_id=req.id,
+            product_id=req.product_id,
+            bracket_trail_amount=req.bracket_trail_amount
+        )
+        
+        if result.get("success", True) and "error" not in result:
+            return {"success": True, "message": "Bracket order updated successfully", "data": result}
+        else:
+            raise HTTPException(status_code=400, detail=result.get("error", "Unknown Delta Exchange error"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/orders/bracket/batch")
+async def update_batch_broker_bracket_orders(
+    req: BracketOrderBatchUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    async def update_target(target: BracketOrderBatchTarget):
+        try:
+            delta_api = get_delta_api(target.broker_id, current_user.id, db)
+            result = await asyncio.to_thread(
+                delta_api.update_bracket_order,
+                order_id=target.order_id,
+                product_id=req.product_id,
+                bracket_trail_amount=req.bracket_trail_amount
+            )
+            
+            if result.get("success", True) and "error" not in result:
+                return {"broker_id": target.broker_id, "order_id": target.order_id, "success": True, "message": "Updated"}
+            else:
+                return {"broker_id": target.broker_id, "order_id": target.order_id, "success": False, "message": result.get("error", "Error")}
+        except Exception as e:
+            return {"broker_id": target.broker_id, "order_id": target.order_id, "success": False, "message": str(e)}
+
+    tasks = [update_target(t) for t in req.targets]
+    results = await asyncio.gather(*tasks)
+    
+    return {"results": results}
+
 

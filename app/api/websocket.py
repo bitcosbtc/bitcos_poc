@@ -172,6 +172,17 @@ class DeltaConnectionPool:
         self.public_symbols: dict[int, set[str]] = {}
         # broker_id -> asyncio Queue to send subscription updates to the public WS task
         self.public_subscription_queues: dict[int, asyncio.Queue] = {}
+        self.connection_lock = asyncio.Lock()
+        self.last_connection_time = 0.0
+
+    async def throttle_connection(self):
+        """Stagger WebSocket connections with a minimum 250ms interval to avoid 429 rate limit."""
+        async with self.connection_lock:
+            now = time.time()
+            elapsed = now - self.last_connection_time
+            if elapsed < 0.25:
+                await asyncio.sleep(0.25 - elapsed)
+            self.last_connection_time = time.time()
 
     async def broadcast_raw(self, broker_id: int, message: str):
         if broker_id in self.clients:
@@ -251,6 +262,7 @@ class DeltaConnectionPool:
         while broker_id in self.clients and len(self.clients[broker_id]) > 0:
             print(f"DEBUG: Shared Private WS connecting for broker {broker_id}...")
             try:
+                await self.throttle_connection()
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=10, open_timeout=15
                 ) as priv_ws:
@@ -311,6 +323,7 @@ class DeltaConnectionPool:
                 queue = self.public_subscription_queues.get(broker_id)
                 if not queue:
                     break
+                await self.throttle_connection()
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=10, open_timeout=15
                 ) as pub_ws:
