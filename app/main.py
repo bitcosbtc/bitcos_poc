@@ -18,6 +18,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://bitcos-frontend.vercel.app",
+        "https://bitcos-dev.vercel.app",
         "http://43.204.233.104",
         "http://localhost:9999",
         "http://127.0.0.1:9999",
