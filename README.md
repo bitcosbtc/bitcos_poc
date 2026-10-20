@@ -249,6 +249,19 @@ These endpoints allow modifying the `bracket_trail_amount` for active stop loss 
 
 
 
+<!-- 
+Step 1 (Analytics & Volatility Service): Backend me ek specialized service module create karenge jo:
 
+Delta ke 4H candles se 7D High/Low & ATR(14) calculate karega.
+0DTE, 1DTE, 2DTE ke Realized Volatility (RV) aur IV Percentile derive karega.
+Option Chain se ATM IV, 25Δ Skew, Term Structure, aur 18Δ strikes filter karega.
 
+Step 2 (Regime Scoring & Decision Logic): Excel sheet ke exact 11 weighted factor rules aur override checks code me implement karenge taaki live BUY Score aur SELL Score generate ho sake.
+
+Step 3 (REST API + Real-Time Caching):
+
+New endpoint: GET /api/trading/analytics/regime-metrics?underlying=BTC
+Real-time caching taaki frontend ya AI agent har second bina delay ke instant data le sake.
+
+Step 4 (AI Agent Integration): Is enriched mathematical data ko AI Decision Agent me feed karenge jo trade setup recommend/execute karega. -->
 

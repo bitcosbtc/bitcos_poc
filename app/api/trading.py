@@ -785,9 +785,13 @@ async def close_positions_by_option_type(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    option_type = req.option_type.lower()
-    if option_type not in ["call", "put"]:
-        raise HTTPException(status_code=400, detail="Invalid option_type. Must be 'call' or 'put'")
+    raw_opt = req.option_type.lower().strip()
+    if raw_opt in ["call", "ce", "c"]:
+        option_type = "call"
+    elif raw_opt in ["put", "pe", "p"]:
+        option_type = "put"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid option_type. Must be 'call'/'ce' or 'put'/'pe'")
         
     # Get active brokers
     if req.broker_ids is not None:
@@ -809,6 +813,22 @@ async def close_positions_by_option_type(
         ).all()
         
     results = []
+
+    def check_is_call(s: str) -> bool:
+        sym = s.upper().strip()
+        return (
+            sym.startswith("C-") or sym.startswith("CE-") or sym.startswith("C_") or sym.startswith("CE_") or
+            sym.endswith("-C") or sym.endswith("-CE") or sym.endswith("_C") or sym.endswith("_CE") or
+            "-C-" in sym or "-CE-" in sym
+        )
+
+    def check_is_put(s: str) -> bool:
+        sym = s.upper().strip()
+        return (
+            sym.startswith("P-") or sym.startswith("PE-") or sym.startswith("P_") or sym.startswith("PE_") or
+            sym.endswith("-P") or sym.endswith("-PE") or sym.endswith("_P") or sym.endswith("_PE") or
+            "-P-" in sym or "-PE-" in sym
+        )
     
     for broker in brokers:
         try:
@@ -824,8 +844,8 @@ async def close_positions_by_option_type(
                 if size == 0:
                     continue
                     
-                is_call = symbol.endswith("-C")
-                is_put = symbol.endswith("-P")
+                is_call = check_is_call(symbol)
+                is_put = check_is_put(symbol)
                 
                 if option_type == "call" and is_call:
                     positions_to_close.append(pos)
